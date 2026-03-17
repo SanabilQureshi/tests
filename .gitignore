@@ -1,1 +1,6 @@
 decompiled/
+__pycache__/
+blutter-main/
+blutter.zip
+blutter_output/
+firmware_update.bin
