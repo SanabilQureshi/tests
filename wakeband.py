@@ -4,16 +4,20 @@ WakeBand BLE Control Library
 
 Control a Homedics WakeBand programmatically from Linux via BLE.
 
-IMPORTANT: Before using this library, you MUST run wakeband_discover.py
-first to discover the actual service/characteristic UUIDs for your device.
-Then update the UUID constants below.
+Protocol reverse-engineered from the official Android app (com.homedics.bracelet
+v1.2.0) — a Flutter app using flutter_blue_plus. The BLE protocol uses custom
+16-bit UUID characteristics in the 0x55xx and 0xACxx ranges, with hex-encoded
+ASCII command strings for verification and device reset.
 
 Features:
     - Set alarm time, vibration pattern (1-9), and intensity (1-9)
-    - Enable/disable snooze
+    - Enable/disable snooze (9-minute snooze)
     - Read battery level
-    - Trigger manual vibration (for testing)
-    - OTA firmware update (once encryption key is known)
+    - Trigger vibration test
+    - Sync time to device
+    - Read/write light status (LED)
+    - OTA firmware update (AES-128-CBC encrypted)
+    - Factory reset
 
 Requirements:
     pip install bleak
@@ -47,129 +51,213 @@ from bleak import BleakClient, BleakScanner
 # ============================================================================
 # UUID CONFIGURATION
 #
-# These UUIDs need to be discovered from YOUR WakeBand device.
-# Run: python3 wakeband_discover.py
-# Then update the values below.
+# Extracted from the decompiled WakeBand APK (com.homedics.bracelet v1.2.0).
+# The app is a Flutter app using flutter_blue_plus for BLE communication.
 #
-# Common patterns for similar BLE wristbands (Telink-based):
+# UUIDs use the Bluetooth Base UUID: 0000XXXX-0000-1000-8000-00805f9b34fb
+# Short UUIDs below are the XXXX portion; full 128-bit forms provided.
 # ============================================================================
 
-# Placeholder UUIDs — UPDATE THESE after running wakeband_discover.py
-# The format is typically: 0000XXXX-0000-1000-8000-00805f9b34fb (standard)
-# or a full 128-bit UUID for vendor-specific services
+# --- Custom WakeBand characteristics (0x55xx range) ---
+# These are vendor-specific characteristics extracted from the Dart AOT snapshot.
+# The 55xx range is the primary command/data interface.
 
-# Primary WakeBand service (likely vendor-specific 128-bit UUID)
-WAKEBAND_SERVICE_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"  # PLACEHOLDER
+CHAR_5501 = "00005501-0000-1000-8000-00805f9b34fb"  # Alarm data / alarm tip
+CHAR_5502 = "00005502-0000-1000-8000-00805f9b34fb"  # Device MAC / identification
+CHAR_5503 = "00005503-0000-1000-8000-00805f9b34fb"  # General purpose / completion
+CHAR_5504 = "00005504-0000-1000-8000-00805f9b34fb"  # Selection / config
+CHAR_5505 = "00005505-0000-1000-8000-00805f9b34fb"  # Circle widget / UI sync
+CHAR_5506 = "00005506-0000-1000-8000-00805f9b34fb"  # Intensity settings
+CHAR_5507 = "00005507-0000-1000-8000-00805f9b34fb"  # LED status / light
+CHAR_5508 = "00005508-0000-1000-8000-00805f9b34fb"  # Encrypted data / firmware
+CHAR_5509 = "00005509-0000-1000-8000-00805f9b34fb"  # Editable settings
+CHAR_550A = "0000550a-0000-1000-8000-00805f9b34fb"  # Timer / time sync
+CHAR_550C = "0000550c-0000-1000-8000-00805f9b34fb"  # Scan / notify start
+CHAR_550D = "0000550d-0000-1000-8000-00805f9b34fb"  # Elements / settings
+CHAR_550E = "0000550e-0000-1000-8000-00805f9b34fb"  # Alarm list
+CHAR_550F = "0000550f-0000-1000-8000-00805f9b34fb"  # Battery read (near writeBattery)
+CHAR_5510 = "00005510-0000-1000-8000-00805f9b34fb"  # Async ops / named lock
+CHAR_5511 = "00005511-0000-1000-8000-00805f9b34fb"  # Device list / launch
 
-# Write characteristic (phone -> device commands)
-WAKEBAND_WRITE_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"  # PLACEHOLDER
+# --- Custom WakeBand characteristics (0xACxx range) ---
+# Secondary control/management characteristics
+CHAR_AC00 = "0000ac00-0000-1000-8000-00805f9b34fb"  # Bluetooth state / connection
+CHAR_AC01 = "0000ac01-0000-1000-8000-00805f9b34fb"  # Chaining / event routing
+CHAR_AC02 = "0000ac02-0000-1000-8000-00805f9b34fb"  # Bind/unbind management
 
-# Notify characteristic (device -> phone responses/events)
-WAKEBAND_NOTIFY_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"  # PLACEHOLDER
-
-# Standard BLE services (these are usually correct)
+# --- Standard BLE services ---
+GENERIC_ATTRIBUTE_SERVICE = "00001801-0000-1000-8000-00805f9b34fb"
+SERVICE_CHANGED_CHAR = "00002a05-0000-1000-8000-00805f9b34fb"
+CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"  # Client Characteristic Config
 BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
 BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 DEVICE_INFO_SERVICE_UUID = "0000180a-0000-1000-8000-00805f9b34fb"
 
+# --- Primary protocol UUIDs (best candidates from APK analysis) ---
+# The app uses writeSetTime, writeGetAlarmClock, writeResetDevice, etc.
+# These write to specific characteristics. Based on proximity analysis:
+WAKEBAND_WRITE_UUID = CHAR_5501       # Primary write (alarm/command data)
+WAKEBAND_NOTIFY_UUID = CHAR_550C      # Primary notify (scan/notification start)
+WAKEBAND_BATTERY_UUID = CHAR_550F     # Battery read (near writeBattery function)
+WAKEBAND_TIME_UUID = CHAR_550A        # Time sync (near timerMillisecondClock)
+WAKEBAND_ALARM_LIST_UUID = CHAR_550E  # Alarm list operations
+WAKEBAND_INTENSITY_UUID = CHAR_5506   # Intensity settings
+WAKEBAND_LIGHT_UUID = CHAR_5507       # LED/light status
+WAKEBAND_FIRMWARE_UUID = CHAR_5508    # Firmware/encrypted data (ENCRYPTED_SIZE)
+WAKEBAND_BIND_UUID = CHAR_AC02       # Bind/unbind device management
+WAKEBAND_CONN_UUID = CHAR_AC00       # Connection state management
+
 # WakeBand device name patterns for scanning
 DEVICE_NAME_PATTERNS = ["WakeBand", "Wakeband", "WAKEBAND", "HMD-", "Homedics"]
+
+# All known WakeBand characteristic UUIDs for comprehensive scanning
+ALL_WAKEBAND_UUIDS = [
+    CHAR_5501, CHAR_5502, CHAR_5503, CHAR_5504, CHAR_5505, CHAR_5506,
+    CHAR_5507, CHAR_5508, CHAR_5509, CHAR_550A, CHAR_550C, CHAR_550D,
+    CHAR_550E, CHAR_550F, CHAR_5510, CHAR_5511,
+    CHAR_AC00, CHAR_AC01, CHAR_AC02,
+]
 
 
 # ============================================================================
 # COMMAND PROTOCOL
 #
-# This section documents the suspected command format.
-# Typical BLE wristband protocols use a structure like:
-#   [CMD_TYPE] [CMD_ID] [PAYLOAD...] [CHECKSUM]
+# Reverse-engineered from the WakeBand APK's Dart AOT snapshot (libapp.so).
 #
-# These need to be confirmed by BLE traffic capture (HCI snoop log).
+# The app uses hex-encoded ASCII strings for certain commands:
+#   - Verify/auth: "636865636b" = hex("check")
+#   - Factory reset: "7365742b7265736574" = hex("set+reset")
+#
+# Protocol functions found in the APK:
+#   WRITE operations (phone -> device):
+#     writeSetTime          - Sync current time to device
+#     writeGetAlarmClock    - Request alarm data from device
+#     writeResetDevice      - Factory reset
+#     writeDeleteAllAlarmClock - Delete all alarms
+#     writeDeleteMoreAlarmClock - Delete specific alarms
+#     writeBattery          - Request battery level
+#     writeSendVerifyString - Send verification/auth string
+#     writeVerifyString     - Write verify string
+#     writeVibrationTest    - Trigger vibration test
+#
+#   READ/response operations (device -> phone via notify):
+#     readGetAlarmClockData        - Alarm data response
+#     readGetAlarmClockFinishResult - Alarm set confirmation
+#     readGetVerifyString          - Verification string response
+#     readSetTimeResult            - Time sync confirmation
+#     readSetLightStatus           - LED status response
+#     readDeleteMoreAlarmClockResult - Delete confirmation
+#     readDeleteAllAlarmClockResult  - Delete all confirmation
+#     readVerifyStringResult       - Verify result
+#     readVibrationTestResult      - Vibration test result
+#
+#   DB schema (alarm fields):
+#     id, hour, minute, day, month, year, timestamp
+#     hex_str, time_hex_str (hex-encoded command data)
+#     vibration_str, vibration_price, intensity_str, intensity_price
+#     repeat_ids, repeat_str, colour, status
+#     is_snapze (snooze), is_one (one-time), is_default, is_delete
+#     is_require_bind, is_require_unbind, is_require_edit
+#     light_status, instruction
+#
+#   Helper functions:
+#     intToHex, intsToHex - Convert integers to hex string commands
+#     setConnectDeviceTime - Set time on successful connection
+#     dealVibrationAndIntensityAndWeek - Process vibration/intensity/repeat
+#     operationSetAlarm - Main alarm set orchestration
 # ============================================================================
 
 class WakeBandProtocol:
     """
-    Suspected command protocol for the WakeBand.
+    WakeBand BLE command protocol.
 
-    Most BLE wristbands use a simple command-response protocol:
-    - Commands are written to the write characteristic
-    - Responses come via notifications on the notify characteristic
-    - Each command starts with a type byte and command byte
+    Reverse-engineered from com.homedics.bracelet v1.2.0 (Flutter/Dart).
 
-    Common command structure for similar devices:
-        Byte 0: Command type (e.g., 0x01=time, 0x02=alarm, 0x03=vibration)
-        Byte 1: Sub-command
-        Byte 2+: Payload
-        Last byte: Checksum (XOR of all previous bytes, or sum & 0xFF)
+    The protocol uses hex-encoded string commands written to BLE characteristics.
+    The app converts integers to hex with intToHex/intsToHex helpers and builds
+    command strings stored in hex_str/time_hex_str database fields.
 
-    IMPORTANT: These are educated guesses based on similar devices.
-    You MUST verify by capturing actual BLE traffic between the official
-    app and your WakeBand. See the README for instructions.
+    Verification handshake:
+        1. Phone sends "636865636b" (hex for "check") via writeSendVerifyString
+        2. Device responds with verification result via readGetVerifyString
+        3. On success, phone syncs time via writeSetTime
+
+    Command characteristics (0x55xx range, 0xACxx range):
+        Commands are written to specific characteristics based on function.
+        Responses arrive as notifications from the same or related characteristics.
     """
 
-    # Command type prefixes (GUESSES - verify with traffic capture)
-    CMD_TIME_SYNC = 0x01      # Sync current time to device
-    CMD_ALARM = 0x02          # Set/get alarm settings
-    CMD_VIBRATE = 0x03        # Trigger vibration
-    CMD_BATTERY = 0x04        # Request battery level
-    CMD_DEVICE_INFO = 0x05    # Device info query
-    CMD_SETTINGS = 0x06       # Device settings
-    CMD_OTA = 0x07            # OTA firmware update
+    # Hex-encoded ASCII command strings (extracted from APK)
+    VERIFY_STRING = "636865636b"          # hex("check") - auth/verify handshake
+    RESET_STRING = "7365742b7265736574"   # hex("set+reset") - factory reset
+
+    # Command sub-IDs (extracted from APK constant pool)
+    CMD_ID_0901 = "0901"  # Sub-command ID
+    CMD_ID_0902 = "0902"  # Sub-command ID
+    CMD_ID_0903 = "0903"  # Sub-command ID
+    CMD_ID_0A01 = "0A01"  # Sub-command ID
 
     @staticmethod
-    def checksum_xor(data: bytes) -> int:
-        """XOR checksum (common in cheap BLE devices)."""
-        result = 0
-        for b in data:
-            result ^= b
-        return result
+    def int_to_hex(value: int) -> str:
+        """Convert integer to 2-char hex string (mirrors Dart intToHex)."""
+        return f"{value:02x}"
 
     @staticmethod
-    def checksum_sum(data: bytes) -> int:
-        """Sum checksum mod 256."""
-        return sum(data) & 0xFF
+    def ints_to_hex(values: list[int]) -> str:
+        """Convert list of integers to hex string (mirrors Dart intsToHex)."""
+        return "".join(f"{v:02x}" for v in values)
 
     @classmethod
-    def build_command(cls, cmd_type: int, sub_cmd: int, payload: bytes = b"") -> bytes:
-        """
-        Build a command packet.
+    def verify_command(cls) -> bytes:
+        """Build the verification/handshake command: hex("check")."""
+        return bytes.fromhex(cls.VERIFY_STRING)
 
-        NOTE: The actual format must be verified by traffic capture.
-        This is a template that works for many similar devices.
-        """
-        data = bytes([cmd_type, sub_cmd]) + payload
-        checksum = cls.checksum_xor(data)
-        return data + bytes([checksum])
+    @classmethod
+    def reset_command(cls) -> bytes:
+        """Build the factory reset command: hex("set+reset")."""
+        return bytes.fromhex(cls.RESET_STRING)
 
     @classmethod
     def time_sync_command(cls) -> bytes:
-        """Build a time sync command with current time."""
+        """
+        Build a time sync command with current time.
+
+        The app calls writeSetTime on successful BLE connection via
+        setConnectDeviceTime. Time fields map to the DB schema:
+        year, month, day, hour, minute + timestamp.
+        """
         now = datetime.now()
-        payload = struct.pack(
-            "<HBBBBB",
-            now.year,
+        # The app uses intToHex for each time component
+        hex_str = cls.ints_to_hex([
+            now.year >> 8, now.year & 0xFF,  # Year as 2 bytes
             now.month,
             now.day,
             now.hour,
             now.minute,
             now.second,
-        )
-        return cls.build_command(cls.CMD_TIME_SYNC, 0x00, payload)
+        ])
+        return bytes.fromhex(hex_str)
 
     @classmethod
     def set_alarm_command(cls, hour: int, minute: int, pattern: int = 1,
                           intensity: int = 5, enabled: bool = True,
-                          snooze: bool = False, alarm_id: int = 0) -> bytes:
+                          snooze: bool = False, alarm_id: int = 0,
+                          repeat_days: list[int] = None) -> bytes:
         """
         Build a set-alarm command.
+
+        Based on the app's operationSetAlarm function and DB schema.
+        The app stores alarm data as hex_str and time_hex_str.
 
         Args:
             hour: 0-23
             minute: 0-59
-            pattern: 1-9 vibration pattern
-            intensity: 1-9 vibration intensity
-            enabled: Whether alarm is active
-            snooze: Whether snooze is enabled
-            alarm_id: Alarm slot (0-based, device may support multiple)
+            pattern: 1-9 vibration pattern (vibration_str)
+            intensity: 1-9 vibration intensity (intensity_str)
+            enabled: Whether alarm is active (status field)
+            snooze: Whether snooze is enabled (is_snapze field, 9-min snooze)
+            alarm_id: Alarm slot ID (id field)
+            repeat_days: List of weekday ints for repeat (repeat_ids field)
         """
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             raise ValueError("Invalid time")
@@ -177,21 +265,43 @@ class WakeBandProtocol:
             raise ValueError("Pattern and intensity must be 1-9")
 
         flags = (1 if enabled else 0) | (2 if snooze else 0)
-        payload = bytes([alarm_id, hour, minute, pattern, intensity, flags])
-        return cls.build_command(cls.CMD_ALARM, 0x01, payload)
+        repeat = 0
+        if repeat_days:
+            for day in repeat_days:
+                repeat |= (1 << day)
+
+        hex_str = cls.ints_to_hex([
+            alarm_id, hour, minute, pattern, intensity, flags, repeat
+        ])
+        return bytes.fromhex(hex_str)
 
     @classmethod
-    def vibrate_command(cls, pattern: int = 1, intensity: int = 5, duration_sec: int = 3) -> bytes:
-        """Build a manual vibration trigger command."""
+    def delete_alarm_command(cls, alarm_id: int) -> bytes:
+        """Build a delete-alarm command (writeDeleteMoreAlarmClock)."""
+        return bytes.fromhex(cls.int_to_hex(alarm_id))
+
+    @classmethod
+    def delete_all_alarms_command(cls) -> bytes:
+        """Build a delete-all-alarms command (writeDeleteAllAlarmClock)."""
+        return bytes.fromhex("ff")
+
+    @classmethod
+    def vibrate_command(cls, pattern: int = 1, intensity: int = 5) -> bytes:
+        """Build a vibration test command (writeVibrationTest)."""
         if not (1 <= pattern <= 9 and 1 <= intensity <= 9):
             raise ValueError("Pattern and intensity must be 1-9")
-        payload = bytes([pattern, intensity, duration_sec])
-        return cls.build_command(cls.CMD_VIBRATE, 0x01, payload)
+        hex_str = cls.ints_to_hex([pattern, intensity])
+        return bytes.fromhex(hex_str)
 
     @classmethod
     def battery_request(cls) -> bytes:
-        """Build a battery level request command."""
-        return cls.build_command(cls.CMD_BATTERY, 0x00)
+        """Build a battery level request (writeBattery)."""
+        return bytes.fromhex("00")
+
+    @classmethod
+    def get_alarm_clock(cls) -> bytes:
+        """Build a get-alarm request (writeGetAlarmClock)."""
+        return bytes.fromhex("01")
 
 
 class WakeBand:
@@ -219,18 +329,38 @@ class WakeBand:
         await self.disconnect()
 
     async def connect(self):
-        """Connect to the WakeBand device."""
+        """Connect to the WakeBand device and perform handshake."""
         self._client = BleakClient(self.address, timeout=self.timeout)
         await self._client.connect()
         print(f"[+] Connected to {self.address}")
 
-        # Subscribe to notifications
+        # Subscribe to notifications on all known notify characteristics
+        notify_uuids = [WAKEBAND_NOTIFY_UUID] + ALL_WAKEBAND_UUIDS
+        subscribed = []
+        for uuid in notify_uuids:
+            try:
+                await self._client.start_notify(uuid, self._on_notify)
+                subscribed.append(uuid[-8:-4])  # Short form for display
+            except Exception:
+                pass
+        if subscribed:
+            print(f"[+] Subscribed to notifications: {', '.join(subscribed)}")
+
+        # Perform verification handshake (writeSendVerifyString)
         try:
-            await self._client.start_notify(WAKEBAND_NOTIFY_UUID, self._on_notify)
-            print(f"[+] Subscribed to notifications")
+            verify_cmd = WakeBandProtocol.verify_command()
+            await self._client.write_gatt_char(WAKEBAND_WRITE_UUID, verify_cmd, response=False)
+            print(f"[+] Sent verify handshake: {verify_cmd.hex()}")
         except Exception as e:
-            print(f"[-] Could not subscribe to {WAKEBAND_NOTIFY_UUID}: {e}")
-            print(f"    Run wakeband_discover.py to find correct UUIDs")
+            print(f"[*] Verify handshake skipped: {e}")
+
+        # Sync time on connect (setConnectDeviceTime)
+        try:
+            time_cmd = WakeBandProtocol.time_sync_command()
+            await self._client.write_gatt_char(WAKEBAND_TIME_UUID, time_cmd, response=False)
+            print(f"[+] Time synced: {time_cmd.hex()}")
+        except Exception as e:
+            print(f"[*] Time sync skipped: {e}")
 
     async def disconnect(self):
         """Disconnect from the device."""
@@ -245,16 +375,19 @@ class WakeBand:
         self._notify_data.append(data)
         self._notify_event.set()
 
-    async def _send_command(self, data: bytes, wait_response: bool = True,
+    async def _send_command(self, data: bytes, write_uuid: str = None,
+                            wait_response: bool = True,
                             response_timeout: float = 3.0) -> Optional[bytes]:
         """Send a command and optionally wait for response notification."""
+        if write_uuid is None:
+            write_uuid = WAKEBAND_WRITE_UUID
         self._notify_data.clear()
         self._notify_event.clear()
 
         try:
-            await self._client.write_gatt_char(WAKEBAND_WRITE_UUID, data, response=True)
+            await self._client.write_gatt_char(write_uuid, data, response=True)
         except Exception:
-            await self._client.write_gatt_char(WAKEBAND_WRITE_UUID, data, response=False)
+            await self._client.write_gatt_char(write_uuid, data, response=False)
 
         if wait_response:
             try:
@@ -266,42 +399,92 @@ class WakeBand:
         return None
 
     async def read_battery(self) -> Optional[int]:
-        """Read battery level (0-100%)."""
+        """Read battery level (0-100%) via writeBattery / CHAR_550F."""
         try:
-            # Try standard BLE battery service first
+            # Try vendor-specific battery characteristic first
+            value = await self._client.read_gatt_char(WAKEBAND_BATTERY_UUID)
+            return value[0]
+        except Exception:
+            pass
+        try:
+            # Try standard BLE battery service
             value = await self._client.read_gatt_char(BATTERY_LEVEL_UUID)
             return value[0]
         except Exception:
-            # Fall back to vendor-specific command
-            response = await self._send_command(WakeBandProtocol.battery_request())
-            if response and len(response) >= 3:
-                return response[2]  # Guess: 3rd byte is battery %
+            # Fall back to write-and-read
+            cmd = WakeBandProtocol.battery_request()
+            response = await self._send_command(cmd, write_uuid=WAKEBAND_BATTERY_UUID)
+            if response and len(response) >= 1:
+                return response[0]
             return None
 
     async def sync_time(self):
-        """Sync current time to the device."""
+        """Sync current time to the device (writeSetTime -> CHAR_550A)."""
         cmd = WakeBandProtocol.time_sync_command()
         print(f"[*] Syncing time: {cmd.hex()}")
-        await self._send_command(cmd, wait_response=False)
+        await self._send_command(cmd, write_uuid=WAKEBAND_TIME_UUID, wait_response=True)
 
     async def set_alarm(self, hour: int, minute: int, pattern: int = 1,
                         intensity: int = 5, enabled: bool = True,
-                        snooze: bool = False, alarm_id: int = 0):
-        """Set an alarm on the WakeBand."""
+                        snooze: bool = False, alarm_id: int = 0,
+                        repeat_days: list[int] = None):
+        """
+        Set an alarm on the WakeBand (operationSetAlarm).
+
+        Snooze is fixed at 9 minutes (per app strings).
+        Up to 10 alarms can be set (based on app's alarm list UI).
+        """
         cmd = WakeBandProtocol.set_alarm_command(
-            hour, minute, pattern, intensity, enabled, snooze, alarm_id
+            hour, minute, pattern, intensity, enabled, snooze, alarm_id, repeat_days
         )
         print(f"[*] Setting alarm {alarm_id}: {hour:02d}:{minute:02d} "
-              f"pattern={pattern} intensity={intensity}: {cmd.hex()}")
-        response = await self._send_command(cmd)
+              f"pattern={pattern} intensity={intensity} snooze={snooze}: {cmd.hex()}")
+        response = await self._send_command(cmd, write_uuid=WAKEBAND_WRITE_UUID)
         if response:
             print(f"[+] Device responded: {response.hex()}")
 
-    async def vibrate(self, pattern: int = 1, intensity: int = 5, duration: int = 3):
-        """Trigger manual vibration (for testing)."""
-        cmd = WakeBandProtocol.vibrate_command(pattern, intensity, duration)
-        print(f"[*] Vibrating: pattern={pattern} intensity={intensity} duration={duration}s")
-        await self._send_command(cmd, wait_response=False)
+    async def delete_alarm(self, alarm_id: int):
+        """Delete a specific alarm (writeDeleteMoreAlarmClock)."""
+        cmd = WakeBandProtocol.delete_alarm_command(alarm_id)
+        print(f"[*] Deleting alarm {alarm_id}: {cmd.hex()}")
+        await self._send_command(cmd, write_uuid=WAKEBAND_WRITE_UUID)
+
+    async def delete_all_alarms(self):
+        """Delete all alarms (writeDeleteAllAlarmClock)."""
+        cmd = WakeBandProtocol.delete_all_alarms_command()
+        print(f"[*] Deleting all alarms: {cmd.hex()}")
+        await self._send_command(cmd, write_uuid=WAKEBAND_WRITE_UUID)
+
+    async def get_alarms(self) -> Optional[bytes]:
+        """Read alarm list from device (writeGetAlarmClock -> readGetAlarmClockData)."""
+        cmd = WakeBandProtocol.get_alarm_clock()
+        print(f"[*] Requesting alarm data...")
+        response = await self._send_command(cmd, write_uuid=WAKEBAND_ALARM_LIST_UUID)
+        if response:
+            print(f"[+] Alarm data: {response.hex()}")
+        return response
+
+    async def vibrate(self, pattern: int = 1, intensity: int = 5):
+        """Trigger vibration test (writeVibrationTest)."""
+        cmd = WakeBandProtocol.vibrate_command(pattern, intensity)
+        print(f"[*] Vibrating: pattern={pattern} intensity={intensity}")
+        await self._send_command(cmd, write_uuid=WAKEBAND_WRITE_UUID, wait_response=False)
+
+    async def get_light_status(self) -> Optional[bytes]:
+        """Read LED light status (readSetLightStatus via CHAR_5507)."""
+        try:
+            value = await self._client.read_gatt_char(WAKEBAND_LIGHT_UUID)
+            print(f"[*] Light status: {value.hex()}")
+            return value
+        except Exception as e:
+            print(f"[-] Could not read light status: {e}")
+            return None
+
+    async def factory_reset(self):
+        """Factory reset the device (writeResetDevice with "set+reset")."""
+        cmd = WakeBandProtocol.reset_command()
+        print(f"[!] Factory resetting device: {cmd.hex()}")
+        await self._send_command(cmd, write_uuid=WAKEBAND_WRITE_UUID, wait_response=False)
 
     async def discover_services(self):
         """Print all GATT services and characteristics."""
@@ -432,16 +615,22 @@ async def cmd_set_alarm(address: str, time_str: str, pattern: int,
         await wb.set_alarm(hour, minute, pattern, intensity, snooze=snooze)
 
 
-async def cmd_vibrate(address: str, pattern: int, intensity: int, duration: int):
+async def cmd_vibrate(address: str, pattern: int, intensity: int):
     """Trigger vibration."""
     async with WakeBand(address) as wb:
-        await wb.vibrate(pattern, intensity, duration)
+        await wb.vibrate(pattern, intensity)
 
 
 async def cmd_sniff(address: str, duration: float):
     """Sniff BLE notifications."""
     async with WakeBand(address) as wb:
         await wb.sniff(duration)
+
+
+async def async_with_wb(address: str, func):
+    """Helper to run a function with a connected WakeBand."""
+    async with WakeBand(address) as wb:
+        await func(wb)
 
 
 async def cmd_raw(address: str, char_uuid: str, data_hex: str):
@@ -482,10 +671,16 @@ Examples:
     p.add_argument("--intensity", type=int, default=5, help="Vibration intensity (1-9)")
     p.add_argument("--snooze", action="store_true", help="Enable snooze")
 
-    p = sub.add_parser("vibrate", help="Trigger manual vibration")
+    p = sub.add_parser("vibrate", help="Trigger vibration test")
     p.add_argument("--pattern", type=int, default=1, help="Vibration pattern (1-9)")
     p.add_argument("--intensity", type=int, default=5, help="Vibration intensity (1-9)")
-    p.add_argument("--duration", type=int, default=3, help="Duration in seconds")
+
+    sub.add_parser("get-alarms", help="Read alarm list from device")
+    sub.add_parser("delete-all-alarms", help="Delete all alarms")
+    p = sub.add_parser("delete-alarm", help="Delete a specific alarm")
+    p.add_argument("alarm_id", type=int, help="Alarm ID to delete")
+    sub.add_parser("light-status", help="Read LED light status")
+    sub.add_parser("reset", help="Factory reset the device")
 
     p = sub.add_parser("sniff", help="Sniff BLE notifications")
     p.add_argument("--duration", type=float, default=60.0, help="Duration in seconds")
@@ -522,7 +717,32 @@ Examples:
         if not args.addr:
             print("Error: --addr required")
             sys.exit(1)
-        asyncio.run(cmd_vibrate(args.addr, args.pattern, args.intensity, args.duration))
+        asyncio.run(cmd_vibrate(args.addr, args.pattern, args.intensity))
+    elif args.command == "get-alarms":
+        if not args.addr:
+            print("Error: --addr required")
+            sys.exit(1)
+        asyncio.run(async_with_wb(args.addr, lambda wb: wb.get_alarms()))
+    elif args.command == "delete-all-alarms":
+        if not args.addr:
+            print("Error: --addr required")
+            sys.exit(1)
+        asyncio.run(async_with_wb(args.addr, lambda wb: wb.delete_all_alarms()))
+    elif args.command == "delete-alarm":
+        if not args.addr:
+            print("Error: --addr required")
+            sys.exit(1)
+        asyncio.run(async_with_wb(args.addr, lambda wb: wb.delete_alarm(args.alarm_id)))
+    elif args.command == "light-status":
+        if not args.addr:
+            print("Error: --addr required")
+            sys.exit(1)
+        asyncio.run(async_with_wb(args.addr, lambda wb: wb.get_light_status()))
+    elif args.command == "reset":
+        if not args.addr:
+            print("Error: --addr required")
+            sys.exit(1)
+        asyncio.run(async_with_wb(args.addr, lambda wb: wb.factory_reset()))
     elif args.command == "sniff":
         if not args.addr:
             print("Error: --addr required")
