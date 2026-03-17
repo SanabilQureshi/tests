@@ -15,57 +15,172 @@ for BLE communication. The device firmware version is 1.8.0.
 - **Manufacturer**: Greatpower-SZ (Shenzhen)
 - **Firmware Updates**: https://raw.githubusercontent.com/greatpower-sz/WakeBand/main/WakeBandFirmwareVersion.txt
 
-## BLE Service Discovery
+## BLE GATT UUIDs
 
-The app does NOT hardcode BLE service/characteristic UUIDs. It uses **dynamic service discovery**:
+The app hardcodes three 16-bit UUIDs in `BluetoothManage._internal()`:
 
-1. Scans for devices advertising the name `WakeBand`
-2. Connects to the device
-3. Calls `discoverServices()` to enumerate all GATT services
-4. Selects the appropriate service and characteristics for read/write/notify
+| UUID | Full UUID (128-bit) | Role |
+|------|---------------------|------|
+| **AC00** | `0000AC00-0000-1000-8000-00805F9B34FB` | **Service UUID** |
+| **AC01** | `0000AC01-0000-1000-8000-00805F9B34FB` | **Notify characteristic** (device → app) |
+| **AC02** | `0000AC02-0000-1000-8000-00805F9B34FB` | **Write characteristic** (app → device) |
 
-The only hardcoded UUID is the standard **CCCD (Client Characteristic Configuration Descriptor)**:
-`00002902-0000-1000-8000-00805f9b34fb`
+The app discovers services dynamically but matches characteristics by checking if
+the characteristic UUID string contains `"AC01"` or `"AC02"` within service `"AC00"`.
 
-**To discover the actual UUIDs, use the `wakeband_discover.py` script** which will connect
-to your device and enumerate all services and characteristics.
+## Command Frame Format
 
-## BLE Write Commands (App → Device)
+All commands use hex string encoding internally. The frame format is:
 
-| Command Method              | Purpose                          |
-|-----------------------------|----------------------------------|
-| `writeSetTime`              | Sync current time to device      |
-| `writeAddAlarmClock`        | Add a new alarm                  |
-| `writeEditAlarmClock`       | Edit an existing alarm           |
-| `writeDeleteMoreAlarmClock` | Delete specific alarm(s)         |
-| `writeDeleteAllAlarmClock`  | Delete all alarms                |
-| `writeGetAlarmClock`        | Request current alarms from device |
-| `writeVibrationTest`        | **Trigger a vibration test**     |
-| `writeBattery`              | Request battery level            |
-| `writeLightStatus`          | Control LED light                |
-| `writeResetDevice`          | Factory reset                    |
-| `writeVerifyString`         | Authentication/pairing verify    |
-| `writeSendVerifyString`     | Send verification string         |
-| `writeUpdateMD5Data`        | Firmware update (MD5 check)      |
-| `writeUpdateData`           | Firmware update (data transfer)  |
+```
+┌────────┬────────┬───────────┬─────────┬──────────┐
+│ Header │ Length │ Command   │ Payload │ Checksum │
+│ 1 byte │ 1 byte│ 2 bytes   │ N bytes │ 1 byte   │
+└────────┴────────┴───────────┴─────────┴──────────┘
+```
 
-## BLE Read/Notification Responses (Device → App)
+### Regular Commands (Header: 0x5A)
 
-| Response Method                  | Purpose                          |
-|----------------------------------|----------------------------------|
-| `readSetTimeResult`              | Time sync confirmation           |
-| `readAddAlarmClockResult`        | Add alarm confirmation           |
-| `readEditAlarmClockResult`       | Edit alarm confirmation          |
-| `readDeleteMoreAlarmClockResult` | Delete alarm(s) confirmation     |
-| `readDeleteAllAlarmClockResult`  | Delete all confirmation          |
-| `readGetAlarmClockData`          | Alarm data response              |
-| `readGetAlarmClockFinishResult`  | All alarms retrieved signal      |
-| `readVibrationTestResult`        | Vibration test confirmation      |
-| `readOneTimeResult`              | One-time alarm response          |
-| `readOpenFirstAlarmClock`        | First alarm activation notice    |
-| `readVerifyStringResult`         | Verification response            |
-| `readUpdateDataSendResult`       | Firmware update progress         |
-| `readUpdateResult`               | Firmware update result           |
+Built by `packBleData(command, data)`:
+
+1. **Header**: `0x5A` (fixed)
+2. **Length**: Number of payload bytes only (NOT including command), as a single byte
+   - Computed by `calculateDataLength(data)`: `len(data_hex_string) / 2`
+3. **Command**: 2-byte command ID (e.g., `0x55 0x09`)
+4. **Payload**: Variable-length data (may be empty)
+5. **Checksum**: `(sum_of_all_bytes_except_header - 1) & 0xFF`
+   - Sum covers: length byte + command bytes + payload bytes
+   - Then subtract 1, then AND with 0xFF
+
+### Firmware Update Commands (Header: 0xE5)
+
+Built by `packBleUpdateData()` — used only for firmware updates.
+
+### Checksum Algorithm (`checkNum`)
+
+```python
+def checksum(data_bytes):
+    """data_bytes includes length + command + payload (NOT the header 0x5A)"""
+    return (sum(data_bytes) - 1) & 0xFF
+```
+
+## Command ID Table (App → Device)
+
+All commands are written to characteristic **AC02**.
+
+| BleWriteType | Command ID | Payload | Purpose |
+|---|---|---|---|
+| 0 (writeVerifyString) | `550C` | `636865636B` (ASCII "check") | Initial connection verification |
+| 1 (writeSendVerifyString) | `550E` | (random code from device) | Send back verification code |
+| 2 (writeSetTime) | `5501` | time data (see below) | Sync current time |
+| 3 (writeBattery) | `5502` | `00` | Request battery level |
+| 4 (writeGetAlarmClock) | `5503` | `00` | Request alarm count |
+| 5 (writeLightStatus) | `5510` | light status data | Control LED |
+| 6 (writeAddAlarmClock) | `5504` | alarm hex data | Add a new alarm |
+| 7 (writeEditAlarmClock) | `5505` | alarm hex data | Edit existing alarm |
+| 8 (writeVibrationTest) | `5509` | mode + intensity | **Trigger vibration** |
+| 9 (writeGetAlarmList) | `5507` | `00` | Request alarm data list |
+| 10 (writeDeleteMoreAlarmClock) | `5506` | `00` | Delete specific alarm(s) |
+| 11 (writeDeleteAllAlarmClock) | `550A` | (data) | Delete all alarms |
+| 12 (writeUpdateMD5Data) | `0901` | MD5 data | Firmware update: MD5 |
+| 13 (writeUpdateData) | `0902` | firmware data | Firmware update: data |
+
+## Response ID Table (Device → App, via AC01 notifications)
+
+Responses are received as notifications on characteristic **AC01**.
+The app reads `substring(0, 4)` of the hex string to identify the response type.
+
+| Response ID | BleReadType | Purpose |
+|---|---|---|
+| `550E` | readGetVerifyString | Device sends random verification code |
+| `550F` | readVerifyStringResult | Verification result |
+| `5501` | readSetTimeResult | Time sync confirmation |
+| `5502` | readBatteryResult | Battery/standby time data |
+| `5503` | readGetAlarmClockData | Alarm data (one alarm per response) |
+| `5504` | readAddAlarmClockResult | Add alarm confirmation |
+| `5505` | readEditAlarmClockResult | Edit alarm confirmation |
+| `5506` | readDeleteMoreAlarmClockResult | Delete alarm confirmation |
+| `5507` | readGetAlarmClockFinishResult | All alarms retrieved signal |
+| `5509` | readVibrationTestResult | Vibration test confirmation |
+| `550A` | readDeleteAllAlarmClockResult | Delete all confirmation |
+| `5510` | readSetLightStatus | Light status confirmation |
+
+### Connection/Authentication Flow
+
+1. App discovers services, finds AC00 service with AC01 (notify) and AC02 (write)
+2. App subscribes to notifications on AC01
+3. Received data starting with `"A5"` → normal response processing
+4. Received data starting with `"5E"` → ignored (likely keep-alive or status)
+5. App sends `writeVerifyString` (`550C` + `"636865636B"` = "check") to device
+6. Device responds with `550E` containing a random verification code
+7. If app has stored verification data, it checks; otherwise treats as new pairing
+8. On success ("01" in response), app emits "connectSuccess" event
+
+## Vibration Test Command Details
+
+**Command ID**: `5509`
+
+**Payload**: `intToHex(mode) + intToHex(intensity)`
+- `mode`: 0-8 (vibration pattern index)
+- `intensity`: 0-8 (vibration strength index)
+
+Each value is converted to a 2-character hex string (zero-padded).
+
+### Example: Vibration Test (mode=0 "Steady Vibe", intensity=4)
+
+```
+Payload: "0004"  (mode=0x00, intensity=0x04)
+Command: "5509"
+Length: len("0004") / 2 = 2 → "02"  (payload bytes only)
+Checksum input: [0x02, 0x55, 0x09, 0x00, 0x04]
+Checksum: (0x02 + 0x55 + 0x09 + 0x00 + 0x04 - 1) & 0xFF = (0x64 - 1) & 0xFF = 0x63
+Full frame: 5A 02 55 09 00 04 63
+```
+
+### Example: Vibration Test (mode=3 "Wink", intensity=8)
+
+```
+Payload: "0308"
+Command: "5509"
+Length: len("0308") / 2 = 2 → "02"
+Checksum input: [0x02, 0x55, 0x09, 0x03, 0x08]
+Checksum: (0x02 + 0x55 + 0x09 + 0x03 + 0x08 - 1) & 0xFF = (0x6B - 1) & 0xFF = 0x6A
+Full frame: 5A 02 55 09 03 08 6A
+```
+
+## Verify String Command Details
+
+**writeVerifyString** (Command `550C`):
+```
+Payload: "636865636B" (ASCII "check")
+Length: len("636865636B") / 2 = 5 → "05"  (payload bytes only)
+Checksum input: [0x05, 0x55, 0x0C, 0x63, 0x68, 0x65, 0x63, 0x6B]
+Checksum: (0x05 + 0x55 + 0x0C + 0x63 + 0x68 + 0x65 + 0x63 + 0x6B - 1) & 0xFF
+         = (0x264 - 1) & 0xFF = 0x63
+Full frame: 5A 05 55 0C 63 68 65 63 6B 63
+```
+
+**writeSendVerifyString** (Command `550E`):
+- Payload is the random code received from the device in the `550E` notification response
+- The code is stored locally for subsequent connections
+
+## Battery Request
+
+**Command ID**: `5502`, **Payload**: `00`
+```
+Length: len("00") / 2 = 1 → "01"  (payload bytes only)
+Checksum input: [0x01, 0x55, 0x02, 0x00]
+Checksum: (0x01 + 0x55 + 0x02 + 0x00 - 1) & 0xFF = (0x58 - 1) & 0xFF = 0x57
+Full frame: 5A 01 55 02 00 57
+```
+
+Response `5502` contains battery/standby time data (decoded via `hexToInt`).
+
+## Set Time Command
+
+**Command ID**: `5501`, **Payload**: time bytes
+
+The time payload is constructed from the current date/time using `intToHex()` for each component.
 
 ## Vibration Modes (9 modes, index 0-8)
 
@@ -104,9 +219,9 @@ CREATE TABLE IF NOT EXISTS alarm_{device_mac} (
     intensity_str TEXT,               -- intensity level name
     is_snapze INTEGER DEFAULT 0,     -- snooze enabled
     is_one INTEGER DEFAULT 0,        -- one-time alarm flag
-    hex_str TEXT,                     -- **BLE command hex bytes**
+    hex_str TEXT,                     -- BLE command hex bytes
     time INTEGER DEFAULT 0,          -- alarm time as integer
-    time_hex_str TEXT,                -- **BLE time command hex bytes**
+    time_hex_str TEXT,                -- BLE time command hex bytes
     is_delete INTEGER DEFAULT 0,     -- soft delete flag
     year INTEGER DEFAULT 0,
     month INTEGER DEFAULT 0,
@@ -114,31 +229,6 @@ CREATE TABLE IF NOT EXISTS alarm_{device_mac} (
     light_status INTEGER DEFAULT 0   -- LED on/off for this alarm
 );
 ```
-
-## Device Info Table
-
-```sql
-CREATE TABLE IF NOT EXISTS device_1000 (
-    device_mac TEXT PRIMARY KEY,
-    device_name TEXT,
-    colour INTEGER DEFAULT 1,
-    light_status INTEGER DEFAULT 0,
-    is_default INTEGER DEFAULT 0,
-    timestamp INTEGER DEFAULT 0,
-    is_require_bind INTEGER DEFAULT 0,
-    is_require_default INTEGER DEFAULT 0,
-    is_require_edit INTEGER DEFAULT 0,
-    is_require_unbind INTEGER DEFAULT 0
-);
-```
-
-## Key Protocol Functions
-
-- `dealAlarmData` - Constructs alarm BLE command bytes from alarm parameters
-- `getWeekHex` - Converts selected weekdays to a hex bitmask
-- `dealVibrationAndIntensityAndWeek` - Combines vibration mode, intensity, and repeat days
-- `loadBleAlarmData` - Loads alarm data from device via BLE
-- `getDeleteAlarmData` - Constructs delete alarm command
 
 ## Week Day Encoding
 
@@ -154,8 +244,9 @@ Days are encoded as a hex bitmask via `getWeekHex`:
 
 ## Notes
 
-- The app uses the `BleWriteType` and `BleReadType` enums to categorize command types
-- All BLE communication goes through a `BluetoothManage` singleton class
-- Command bytes are stored as hex strings in the `hex_str` DB field
-- The protocol uses a request-response pattern: write a command, receive notification
-- The firmware update binary is served from GitHub: `db_update_data.bin` (encrypted)
+- All BLE communication goes through `BluetoothManage` singleton
+- The protocol works entirely with hex strings internally (each byte = 2 hex chars)
+- `hexStrToInts()` converts hex string to byte array before BLE write
+- `intsToHex()` converts received byte array to hex string for parsing
+- The protocol uses a request-response pattern: write to AC02, receive notification on AC01
+- Firmware update uses different header `0xE5` and command IDs `0901`/`0902`

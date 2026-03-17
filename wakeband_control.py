@@ -3,92 +3,194 @@
 WakeBand BLE Control Tool
 
 Control your HoMedics WakeBand from Linux via BLE.
+Protocol reverse-engineered from the companion app (com.homedics.bracelet v1.2.0).
 
 Usage:
-    # First, discover your device's UUIDs:
-    python3 wakeband_discover.py
-
-    # Then update the UUIDs below and run:
-    python3 wakeband_control.py vibrate               # Test vibration (mode=0, intensity=4)
-    python3 wakeband_control.py vibrate --mode 3 --intensity 7
     python3 wakeband_control.py scan                   # Scan for devices
-    python3 wakeband_control.py discover               # Full service discovery
+    python3 wakeband_control.py vibrate                # Test vibration (mode=0, intensity=4)
+    python3 wakeband_control.py vibrate --mode 3 --intensity 7
     python3 wakeband_control.py battery                # Read battery level
+    python3 wakeband_control.py set-time               # Sync current time
     python3 wakeband_control.py sniff                  # Sniff all notifications
-    python3 wakeband_control.py write AA BB CC DD      # Send raw hex bytes
-    python3 wakeband_control.py set-alarm 07:30 --vibration 2 --intensity 5 --days mon,tue,wed,thu,fri
+    python3 wakeband_control.py write 5A 04 55 09 00 04 6B  # Send raw hex bytes
 
 Requirements: pip install bleak
 """
 
 import asyncio
 import argparse
-import struct
 import sys
-import time
 from datetime import datetime
 from bleak import BleakScanner, BleakClient, BleakGATTCharacteristic
 
-# ============================================================================
-# CONFIGURATION - Update these after running wakeband_discover.py
-# ============================================================================
-DEVICE_ADDRESS = ""  # e.g., "AA:BB:CC:DD:EE:FF"
-SERVICE_UUID = ""    # e.g., "0000fff0-0000-1000-8000-00805f9b34fb"
-WRITE_CHAR_UUID = "" # The characteristic with write property
-NOTIFY_CHAR_UUID = "" # The characteristic with notify property
-# ============================================================================
+# BLE UUIDs (from app's BluetoothManage._internal())
+SERVICE_UUID = "0000ac00-0000-1000-8000-00805f9b34fb"
+NOTIFY_CHAR_UUID = "0000ac01-0000-1000-8000-00805f9b34fb"  # device -> app
+WRITE_CHAR_UUID = "0000ac02-0000-1000-8000-00805f9b34fb"   # app -> device
 
 DEVICE_NAME = "WakeBand"
 SCAN_TIMEOUT = 10
 CONNECT_TIMEOUT = 20
 RESPONSE_TIMEOUT = 5
 
+# Protocol constants
+HEADER = 0x5A
+
+# Command IDs (app -> device, written to AC02)
+CMD_SET_TIME = (0x55, 0x01)
+CMD_BATTERY = (0x55, 0x02)
+CMD_GET_ALARM_COUNT = (0x55, 0x03)
+CMD_ADD_ALARM = (0x55, 0x04)
+CMD_EDIT_ALARM = (0x55, 0x05)
+CMD_DELETE_ALARM = (0x55, 0x06)
+CMD_GET_ALARM_LIST = (0x55, 0x07)
+CMD_VIBRATION_TEST = (0x55, 0x09)
+CMD_DELETE_ALL_ALARMS = (0x55, 0x0A)
+CMD_VERIFY_STRING = (0x55, 0x0C)
+CMD_SEND_VERIFY = (0x55, 0x0E)
+CMD_LIGHT_STATUS = (0x55, 0x10)
+
+# Response IDs (device -> app, received on AC01)
+RESP_VERIFY_CODE = "550e"
+RESP_VERIFY_RESULT = "550f"
+RESP_SET_TIME = "5501"
+RESP_BATTERY = "5502"
+RESP_ALARM_DATA = "5503"
+RESP_ADD_ALARM = "5504"
+RESP_EDIT_ALARM = "5505"
+RESP_DELETE_ALARM = "5506"
+RESP_ALARM_LIST_DONE = "5507"
+RESP_VIBRATION = "5509"
+RESP_DELETE_ALL = "550a"
+RESP_LIGHT = "5510"
+
 # Vibration modes (index 0-8)
 VIBRATION_MODES = {
-    0: "Steady Vibe",
-    1: "Ramp Climb",
-    2: "Rumble",
-    3: "Wink",
-    4: "Jolt",
-    5: "Pulse Beat",
-    6: "Rapid Pulse",
-    7: "Ascension Vibe",
-    8: "Random",
+    0: "Steady Vibe",    1: "Ramp Climb",     2: "Rumble",
+    3: "Wink",           4: "Jolt",           5: "Pulse Beat",
+    6: "Rapid Pulse",    7: "Ascension Vibe", 8: "Random",
 }
 
-# Day encoding for repeat alarms
+# Day encoding bitmask
 DAYS = {
     "mon": 0x01, "tue": 0x02, "wed": 0x04, "thu": 0x08,
     "fri": 0x10, "sat": 0x20, "sun": 0x40,
 }
 
 
+def int_to_hex(value: int) -> str:
+    """Convert int to 2-char hex string (zero-padded), matching app's intToHex()."""
+    h = format(value, "x")
+    if len(h) % 2 == 1:
+        h = "0" + h
+    return h
+
+
+def checksum(data_bytes: list[int]) -> int:
+    """Compute checksum: (sum(length + command + payload) - 1) & 0xFF."""
+    return (sum(data_bytes) - 1) & 0xFF
+
+
+def build_frame(cmd: tuple[int, int], payload: bytes = b"") -> bytes:
+    """Build a complete BLE command frame.
+
+    Frame format: [0x5A] [length] [cmd_hi] [cmd_lo] [payload...] [checksum]
+
+    length = number of payload bytes only (NOT including command bytes)
+    checksum = (sum(length + command + payload) - 1) & 0xFF
+    """
+    cmd_hi, cmd_lo = cmd
+    data_bytes = list(payload)
+    length = len(data_bytes)  # payload bytes only, per calculateDataLength()
+
+    # Bytes that go into checksum: length + command + payload
+    check_input = [length, cmd_hi, cmd_lo] + data_bytes
+    chk = checksum(check_input)
+
+    return bytes([HEADER, length, cmd_hi, cmd_lo] + data_bytes + [chk])
+
+
 class WakeBandController:
     def __init__(self, address: str = None):
-        self.address = address or DEVICE_ADDRESS
+        self.address = address
         self.client = None
         self.write_char = None
         self.notify_char = None
         self.response_event = asyncio.Event()
         self.last_response = None
+        self.last_response_hex = ""
+        self.verified = False
+        self.verify_code = None
 
     def _notification_handler(self, sender: BleakGATTCharacteristic, data: bytearray):
         """Handle incoming BLE notifications from the device."""
         hex_str = data.hex()
-        print(f"  << NOTIFY [{sender.uuid}]: {hex_str} ({len(data)} bytes)")
         self.last_response = data
+        self.last_response_hex = hex_str
+
+        # Determine prefix type
+        if hex_str.startswith("a5"):
+            # Normal response - strip A5 header to get response body
+            body = hex_str[2:]  # skip "a5" prefix byte
+            resp_id = body[:4] if len(body) >= 4 else ""
+            self._decode_response(resp_id, body, data)
+        elif hex_str.startswith("5e"):
+            # Keep-alive / status - ignore
+            print(f"  << KEEPALIVE: {hex_str}")
+        else:
+            # Try parsing directly (some responses may not have A5 prefix)
+            resp_id = hex_str[:4] if len(hex_str) >= 4 else ""
+            self._decode_response(resp_id, hex_str, data)
+
         self.response_event.set()
 
-        # Try to decode known response types
-        self._decode_response(data)
+    def _decode_response(self, resp_id: str, hex_str: str, raw: bytearray):
+        """Decode known response types."""
+        resp_id = resp_id.lower()
 
-    def _decode_response(self, data: bytearray):
-        """Attempt to decode known response formats."""
-        if len(data) < 2:
-            return
-        # Common response patterns will be logged here
-        # The exact format depends on the device firmware
-        print(f"       Raw bytes: {list(data)}")
+        if resp_id == RESP_VERIFY_CODE:
+            # Device sends random verification code
+            code = hex_str[4:]  # everything after "550e"
+            self.verify_code = code
+            print(f"  << VERIFY CODE: {code}")
+        elif resp_id == RESP_VERIFY_RESULT:
+            result = hex_str[4:6] if len(hex_str) >= 6 else ""
+            if result == "01":
+                self.verified = True
+                print(f"  << VERIFY: Success")
+            else:
+                print(f"  << VERIFY: Failed ({result})")
+        elif resp_id == RESP_BATTERY:
+            # Battery data follows the response ID
+            battery_data = hex_str[4:]
+            if len(battery_data) >= 2:
+                battery_pct = int(battery_data[:2], 16)
+                print(f"  << BATTERY: {battery_pct}%")
+                if len(battery_data) >= 4:
+                    standby = int(battery_data[2:4], 16)
+                    print(f"     Standby: {standby}h")
+            else:
+                print(f"  << BATTERY (raw): {hex_str}")
+        elif resp_id == RESP_SET_TIME:
+            print(f"  << TIME SYNC: OK")
+        elif resp_id == RESP_VIBRATION:
+            print(f"  << VIBRATION: Confirmed")
+        elif resp_id == RESP_ALARM_DATA:
+            print(f"  << ALARM DATA: {hex_str[4:]}")
+        elif resp_id == RESP_ALARM_LIST_DONE:
+            print(f"  << ALARM LIST: Complete")
+        elif resp_id == RESP_ADD_ALARM:
+            print(f"  << ADD ALARM: OK")
+        elif resp_id == RESP_EDIT_ALARM:
+            print(f"  << EDIT ALARM: OK")
+        elif resp_id == RESP_DELETE_ALARM:
+            print(f"  << DELETE ALARM: OK")
+        elif resp_id == RESP_DELETE_ALL:
+            print(f"  << DELETE ALL ALARMS: OK")
+        elif resp_id == RESP_LIGHT:
+            print(f"  << LIGHT STATUS: OK")
+        else:
+            print(f"  << UNKNOWN [{resp_id}]: {hex_str}")
 
     async def find_device(self) -> str:
         """Scan for WakeBand and return its address."""
@@ -106,7 +208,7 @@ class WakeBandController:
         raise RuntimeError(f"No '{DEVICE_NAME}' device found. Is it powered on?")
 
     async def connect(self):
-        """Connect to the WakeBand and set up characteristics."""
+        """Connect to the WakeBand, discover services, and authenticate."""
         address = await self.find_device()
         print(f"Connecting to {address}...")
 
@@ -114,40 +216,66 @@ class WakeBandController:
         await self.client.connect()
         print(f"Connected (MTU={self.client.mtu_size})")
 
-        # Auto-discover characteristics if not configured
-        if not WRITE_CHAR_UUID or not NOTIFY_CHAR_UUID:
-            await self._auto_discover()
-        else:
-            self.write_char = WRITE_CHAR_UUID
-            self.notify_char = NOTIFY_CHAR_UUID
+        # Find AC00 service with AC01/AC02 characteristics
+        self._discover_characteristics()
 
-        # Enable notifications
-        if self.notify_char:
-            await self.client.start_notify(self.notify_char, self._notification_handler)
-            print(f"Notifications enabled on {self.notify_char}")
+        # Enable notifications on AC01
+        await self.client.start_notify(self.notify_char, self._notification_handler)
+        print(f"Notifications enabled on {self.notify_char}")
 
-    async def _auto_discover(self):
-        """Auto-discover write and notify characteristics."""
-        print("Auto-discovering characteristics...")
+        # Authenticate
+        await self._authenticate()
+
+    def _discover_characteristics(self):
+        """Find AC00 service with AC01 (notify) and AC02 (write) characteristics."""
         for service in self.client.services:
-            # Skip standard BLE services (Generic Access, Generic Attribute, Device Info)
-            uuid_short = service.uuid[4:8].lower()
-            if uuid_short in ("1800", "1801", "180a"):
-                continue
+            if "ac00" in service.uuid.lower():
+                for char in service.characteristics:
+                    uuid_lower = char.uuid.lower()
+                    if "ac01" in uuid_lower:
+                        self.notify_char = char.uuid
+                    elif "ac02" in uuid_lower:
+                        self.write_char = char.uuid
+                break
 
-            for char in service.characteristics:
-                props = char.properties
-                if ("write" in props or "write-without-response" in props) and not self.write_char:
-                    self.write_char = char.uuid
-                    print(f"  Write char: {char.uuid} (service: {service.uuid})")
-                if ("notify" in props or "indicate" in props) and not self.notify_char:
-                    self.notify_char = char.uuid
-                    print(f"  Notify char: {char.uuid} (service: {service.uuid})")
+        if not self.write_char or not self.notify_char:
+            # Fallback: use hardcoded UUIDs
+            self.write_char = self.write_char or WRITE_CHAR_UUID
+            self.notify_char = self.notify_char or NOTIFY_CHAR_UUID
+            print(f"  Using fallback UUIDs (write={self.write_char}, notify={self.notify_char})")
+        else:
+            print(f"  Service AC00 found: write={self.write_char}, notify={self.notify_char}")
 
-        if not self.write_char:
-            raise RuntimeError("No writable characteristic found!")
-        if not self.notify_char:
-            print("WARNING: No notify characteristic found. Responses won't be received.")
+    async def _authenticate(self):
+        """Perform the connection verification handshake.
+
+        1. Send writeVerifyString: command 550C + payload "636865636B" ("check")
+        2. Device responds with 550E + random verification code
+        3. Send writeSendVerifyString: command 550E + the received code
+        4. Device responds with 550F + "01" on success
+        """
+        print("Authenticating...")
+
+        # Step 1: Send "check" string
+        check_payload = bytes.fromhex("636865636B")  # ASCII "check"
+        frame = build_frame(CMD_VERIFY_STRING, check_payload)
+        print(f"  >> VERIFY: {frame.hex()}")
+        await self._write_and_wait(frame)
+
+        if not self.verify_code:
+            print("  WARNING: No verification code received. Device may not require auth.")
+            return
+
+        # Step 2: Send back the verification code
+        code_payload = bytes.fromhex(self.verify_code)
+        frame = build_frame(CMD_SEND_VERIFY, code_payload)
+        print(f"  >> SEND VERIFY: {frame.hex()}")
+        await self._write_and_wait(frame)
+
+        if self.verified:
+            print("Authentication successful!")
+        else:
+            print("WARNING: Authentication may have failed. Continuing anyway...")
 
     async def disconnect(self):
         """Disconnect from the device."""
@@ -155,116 +283,51 @@ class WakeBandController:
             await self.client.disconnect()
             print("Disconnected")
 
-    async def write_command(self, data: bytes, wait_response: bool = True) -> bytearray:
-        """Write a command and optionally wait for response."""
-        hex_str = data.hex()
-        print(f"  >> WRITE [{self.write_char}]: {hex_str} ({len(data)} bytes)")
-        print(f"       Raw bytes: {list(data)}")
-
+    async def _write_and_wait(self, data: bytes, timeout: float = RESPONSE_TIMEOUT) -> bytearray:
+        """Write data and wait for a notification response."""
         self.response_event.clear()
         self.last_response = None
 
         await self.client.write_gatt_char(self.write_char, data, response=True)
 
-        if wait_response and self.notify_char:
-            try:
-                await asyncio.wait_for(self.response_event.wait(), RESPONSE_TIMEOUT)
-            except asyncio.TimeoutError:
-                print("  !! No response received (timeout)")
+        try:
+            await asyncio.wait_for(self.response_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            print("  !! No response (timeout)")
 
         return self.last_response
 
     async def vibration_test(self, mode: int = 0, intensity: int = 4):
-        """Trigger a vibration test on the device.
+        """Trigger a vibration test.
 
-        Since the exact command bytes need to be discovered from your device,
-        this method tries common BLE wearable command formats.
-
-        mode: 0-8 (vibration pattern)
-        intensity: 0-8 (vibration strength)
+        Command 5509, payload: intToHex(mode) + intToHex(intensity)
+        mode: 0-8, intensity: 0-8
         """
         mode = max(0, min(8, mode))
         intensity = max(0, min(8, intensity))
-
         mode_name = VIBRATION_MODES.get(mode, "Unknown")
-        print(f"\nVibration test: mode={mode} ({mode_name}), intensity={intensity}")
+        print(f"\nVibration: mode={mode} ({mode_name}), intensity={intensity}")
 
-        # The exact command format needs to be discovered from your device.
-        # Common Chinese BLE wearable command formats:
-        #
-        # Format A: [header, cmd_type, mode, intensity, checksum]
-        # Format B: [0xAA, length, cmd_id, mode, intensity, checksum]
-        # Format C: [cmd_id, sub_cmd, mode, intensity]
-        #
-        # We'll try the most common formats. Check the responses to determine
-        # which one your device accepts.
-
-        # Try writing vibration test commands in common formats
-        # The user should monitor notifications to see which format gets a valid response
-
-        # Approach: construct a minimal vibration test command
-        # Based on the app's writeVibrationTest method
-        commands_to_try = [
-            # Format: [command_byte, mode, intensity]
-            bytes([0x09, mode, intensity]),
-            bytes([0x09, mode + 1, intensity + 1]),  # 1-indexed
-            # With header byte
-            bytes([0xAA, 0x09, mode, intensity]),
-            bytes([0xAA, 0x03, 0x09, mode, intensity]),
-            # With checksum (XOR of all bytes)
-            self._with_checksum(bytes([0x09, mode, intensity])),
-            self._with_checksum(bytes([0xAA, 0x09, mode, intensity])),
-        ]
-
-        for i, cmd in enumerate(commands_to_try):
-            print(f"\n--- Trying command format {i+1} ---")
-            resp = await self.write_command(cmd)
-            if resp:
-                print(f"  Got response! This format may be correct.")
-                # Wait a bit for the vibration to complete
-                await asyncio.sleep(2)
-                return resp
-            await asyncio.sleep(1)
-
-        print("\nNone of the standard formats got a response.")
-        print("Use 'sniff' mode while using the phone app to capture the exact command bytes.")
-        return None
-
-    def _with_checksum(self, data: bytes) -> bytes:
-        """Append XOR checksum byte."""
-        checksum = 0
-        for b in data:
-            checksum ^= b
-        return data + bytes([checksum & 0xFF])
-
-    def _with_sum_checksum(self, data: bytes) -> bytes:
-        """Append sum checksum byte."""
-        checksum = sum(data) & 0xFF
-        return data + bytes([checksum])
+        payload = bytes([mode, intensity])
+        frame = build_frame(CMD_VIBRATION_TEST, payload)
+        print(f"  >> {frame.hex()}")
+        return await self._write_and_wait(frame)
 
     async def read_battery(self):
-        """Request battery level from the device."""
+        """Request battery level. Command 5502, payload: 00."""
         print("\nRequesting battery level...")
-        # Common battery request commands
-        commands = [
-            bytes([0x06]),
-            bytes([0xAA, 0x06]),
-            bytes([0x03]),
-        ]
-        for cmd in commands:
-            resp = await self.write_command(cmd)
-            if resp:
-                return resp
-        return None
+        frame = build_frame(CMD_BATTERY, bytes([0x00]))
+        print(f"  >> {frame.hex()}")
+        return await self._write_and_wait(frame)
 
     async def set_time(self):
-        """Sync current time to the device."""
+        """Sync current time to the device. Command 5501."""
         now = datetime.now()
         print(f"\nSetting time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # Common time sync formats
-        time_data = bytes([
-            now.year - 2000,  # Year offset from 2000
+        # Build time payload using intToHex for each component
+        payload = bytes([
+            now.year >> 8, now.year & 0xFF,  # year as 2 bytes
             now.month,
             now.day,
             now.hour,
@@ -273,76 +336,48 @@ class WakeBandController:
             now.weekday() + 1,  # 1=Monday, 7=Sunday
         ])
 
-        commands = [
-            bytes([0x01]) + time_data,
-            bytes([0xAA, 0x01]) + time_data,
-            bytes([0xAA, len(time_data) + 1, 0x01]) + time_data,
-        ]
-        for cmd in commands:
-            resp = await self.write_command(cmd)
-            if resp:
-                return resp
-        return None
+        frame = build_frame(CMD_SET_TIME, payload)
+        print(f"  >> {frame.hex()}")
+        return await self._write_and_wait(frame)
 
-    async def set_alarm(self, hour: int, minute: int, vibration: int = 0,
-                        intensity: int = 4, days: int = 0x7F, enabled: bool = True,
-                        alarm_id: int = 1):
-        """Set an alarm on the device.
+    async def get_alarms(self):
+        """Request alarm list from device."""
+        print("\nRequesting alarm list...")
 
-        hour: 0-23
-        minute: 0-59
-        vibration: 0-8 (vibration mode index)
-        intensity: 0-8 (intensity level)
-        days: bitmask (0x01=Mon, 0x02=Tue, 0x04=Wed, 0x08=Thu, 0x10=Fri, 0x20=Sat, 0x40=Sun)
-        enabled: True to enable, False to disable
-        alarm_id: alarm slot (1-based)
-        """
-        mode_name = VIBRATION_MODES.get(vibration, "Unknown")
-        days_str = self._days_to_str(days)
-        print(f"\nSetting alarm: {hour:02d}:{minute:02d}")
-        print(f"  Vibration: {vibration} ({mode_name})")
-        print(f"  Intensity: {intensity}")
-        print(f"  Days: {days_str}")
-        print(f"  Enabled: {enabled}")
+        # First get alarm count
+        frame = build_frame(CMD_GET_ALARM_COUNT, bytes([0x00]))
+        print(f"  >> GET COUNT: {frame.hex()}")
+        await self._write_and_wait(frame)
 
-        alarm_data = bytes([
-            alarm_id,
-            1 if enabled else 0,
-            hour,
-            minute,
-            vibration,
-            intensity,
-            days,
-        ])
+        # Then request alarm data
+        frame = build_frame(CMD_GET_ALARM_LIST, bytes([0x00]))
+        print(f"  >> GET LIST: {frame.hex()}")
+        resp = await self._write_and_wait(frame)
 
-        commands = [
-            bytes([0x02]) + alarm_data,
-            bytes([0xAA, 0x02]) + alarm_data,
-            self._with_checksum(bytes([0x02]) + alarm_data),
-        ]
-        for cmd in commands:
-            resp = await self.write_command(cmd)
-            if resp:
-                return resp
-        return None
+        # Wait for additional alarm data notifications
+        for _ in range(10):
+            self.response_event.clear()
+            try:
+                await asyncio.wait_for(self.response_event.wait(), 2)
+                if self.last_response_hex[:4].lower() == RESP_ALARM_LIST_DONE:
+                    break
+            except asyncio.TimeoutError:
+                break
 
-    def _days_to_str(self, days: int) -> str:
-        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        result = []
-        for i, name in enumerate(day_names):
-            if days & (1 << i):
-                result.append(name)
-        return ", ".join(result) if result else "None"
+        return resp
+
+    async def delete_all_alarms(self):
+        """Delete all alarms. Command 550A."""
+        print("\nDeleting all alarms...")
+        frame = build_frame(CMD_DELETE_ALL_ALARMS, bytes([0x00]))
+        print(f"  >> {frame.hex()}")
+        return await self._write_and_wait(frame)
 
     async def sniff(self, duration: int = 60):
-        """Sniff all BLE notifications for the specified duration.
-
-        Use this while operating the phone app to capture command/response pairs.
-        """
+        """Sniff all BLE notifications for the specified duration."""
         print(f"\nSniffing notifications for {duration}s...")
         print("Use the phone app to trigger actions and observe the captured data.")
         print("Press Ctrl+C to stop.\n")
-
         try:
             await asyncio.sleep(duration)
         except asyncio.CancelledError:
@@ -350,14 +385,15 @@ class WakeBandController:
         print("\nSniff complete.")
 
     async def write_raw(self, hex_bytes: list):
-        """Write raw hex bytes to the device."""
+        """Write raw hex bytes to the device (no framing)."""
         data = bytes(int(b, 16) for b in hex_bytes)
-        print(f"\nWriting raw bytes...")
-        return await self.write_command(data)
+        print(f"\nWriting raw: {data.hex()} ({len(data)} bytes)")
+        return await self._write_and_wait(data)
 
+
+# CLI command handlers
 
 async def cmd_scan(args):
-    """Scan for WakeBand devices."""
     print(f"Scanning for BLE devices ({SCAN_TIMEOUT}s)...")
     devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
 
@@ -383,22 +419,7 @@ async def cmd_scan(args):
             print(f"  {name:30s} [{d.address}] RSSI={d.rssi}")
 
 
-async def cmd_discover(args):
-    """Discover services on the device."""
-    # Import and run the discovery script logic
-    from wakeband_discover import discover_services, scan_for_wakeband
-
-    address = args.address
-    if not address:
-        wakebands = await scan_for_wakeband()
-        if wakebands:
-            address = wakebands[0].address
-    if address:
-        await discover_services(address)
-
-
 async def cmd_vibrate(args):
-    """Trigger a vibration test."""
     ctrl = WakeBandController(args.address)
     try:
         await ctrl.connect()
@@ -408,7 +429,6 @@ async def cmd_vibrate(args):
 
 
 async def cmd_battery(args):
-    """Read battery level."""
     ctrl = WakeBandController(args.address)
     try:
         await ctrl.connect()
@@ -418,7 +438,6 @@ async def cmd_battery(args):
 
 
 async def cmd_set_time(args):
-    """Sync time to device."""
     ctrl = WakeBandController(args.address)
     try:
         await ctrl.connect()
@@ -427,35 +446,25 @@ async def cmd_set_time(args):
         await ctrl.disconnect()
 
 
-async def cmd_set_alarm(args):
-    """Set an alarm."""
-    hour, minute = map(int, args.time.split(":"))
-    days = 0
-    if args.days:
-        for d in args.days.split(","):
-            d = d.strip().lower()[:3]
-            if d in DAYS:
-                days |= DAYS[d]
-    else:
-        days = 0x7F  # Every day
-
+async def cmd_alarms(args):
     ctrl = WakeBandController(args.address)
     try:
         await ctrl.connect()
-        await ctrl.set_alarm(
-            hour=hour,
-            minute=minute,
-            vibration=args.vibration,
-            intensity=args.intensity,
-            days=days,
-            enabled=True,
-        )
+        await ctrl.get_alarms()
+    finally:
+        await ctrl.disconnect()
+
+
+async def cmd_delete_alarms(args):
+    ctrl = WakeBandController(args.address)
+    try:
+        await ctrl.connect()
+        await ctrl.delete_all_alarms()
     finally:
         await ctrl.disconnect()
 
 
 async def cmd_sniff(args):
-    """Sniff BLE notifications."""
     ctrl = WakeBandController(args.address)
     try:
         await ctrl.connect()
@@ -465,7 +474,6 @@ async def cmd_sniff(args):
 
 
 async def cmd_write(args):
-    """Write raw hex bytes."""
     ctrl = WakeBandController(args.address)
     try:
         await ctrl.connect()
@@ -482,15 +490,14 @@ def main():
 Examples:
   %(prog)s scan                           # Scan for WakeBand devices
   %(prog)s scan --all                     # Show all BLE devices
-  %(prog)s discover                       # Discover BLE services/characteristics
   %(prog)s vibrate                        # Test vibration (default mode & intensity)
   %(prog)s vibrate --mode 3 --intensity 7 # Specific mode & intensity
   %(prog)s battery                        # Read battery level
   %(prog)s set-time                       # Sync current time
-  %(prog)s set-alarm 07:30                # Set alarm for 7:30 AM (every day)
-  %(prog)s set-alarm 07:30 --days mon,tue,wed,thu,fri --vibration 2 --intensity 5
+  %(prog)s alarms                         # List alarms on device
+  %(prog)s delete-alarms                  # Delete all alarms
   %(prog)s sniff --duration 120           # Sniff notifications for 2 minutes
-  %(prog)s write AA BB CC DD              # Send raw hex bytes
+  %(prog)s write 5A 04 55 09 00 04 6B     # Send raw hex bytes
 
 Vibration modes (--mode):
   0: Steady Vibe    3: Wink        6: Rapid Pulse
@@ -498,8 +505,6 @@ Vibration modes (--mode):
   2: Rumble         5: Pulse Beat  8: Random
 
 Intensity levels (--intensity): 0 (lightest) to 8 (strongest)
-
-Day codes (--days): mon,tue,wed,thu,fri,sat,sun
 """)
 
     parser.add_argument("--address", "-a", help="Device BLE address (XX:XX:XX:XX:XX:XX)")
@@ -509,9 +514,6 @@ Day codes (--days): mon,tue,wed,thu,fri,sat,sun
     # scan
     p_scan = subparsers.add_parser("scan", help="Scan for WakeBand devices")
     p_scan.add_argument("--all", action="store_true", help="Show all BLE devices")
-
-    # discover
-    p_discover = subparsers.add_parser("discover", help="Discover BLE services")
 
     # vibrate
     p_vib = subparsers.add_parser("vibrate", help="Trigger vibration test")
@@ -526,14 +528,11 @@ Day codes (--days): mon,tue,wed,thu,fri,sat,sun
     # set-time
     subparsers.add_parser("set-time", help="Sync current time to device")
 
-    # set-alarm
-    p_alarm = subparsers.add_parser("set-alarm", help="Set an alarm")
-    p_alarm.add_argument("time", help="Alarm time (HH:MM)")
-    p_alarm.add_argument("--vibration", "-v", type=int, default=0, choices=range(9),
-                         help="Vibration mode (0-8)")
-    p_alarm.add_argument("--intensity", "-i", type=int, default=4, choices=range(9),
-                         help="Intensity level (0-8)")
-    p_alarm.add_argument("--days", "-d", help="Repeat days (mon,tue,wed,thu,fri,sat,sun)")
+    # alarms
+    subparsers.add_parser("alarms", help="List alarms on device")
+
+    # delete-alarms
+    subparsers.add_parser("delete-alarms", help="Delete all alarms")
 
     # sniff
     p_sniff = subparsers.add_parser("sniff", help="Sniff BLE notifications")
@@ -542,17 +541,17 @@ Day codes (--days): mon,tue,wed,thu,fri,sat,sun
 
     # write
     p_write = subparsers.add_parser("write", help="Write raw hex bytes")
-    p_write.add_argument("bytes", nargs="+", help="Hex bytes (e.g., AA BB CC)")
+    p_write.add_argument("bytes", nargs="+", help="Hex bytes (e.g., 5A 04 55 09 00 04 6B)")
 
     args = parser.parse_args()
 
     commands = {
         "scan": cmd_scan,
-        "discover": cmd_discover,
         "vibrate": cmd_vibrate,
         "battery": cmd_battery,
         "set-time": cmd_set_time,
-        "set-alarm": cmd_set_alarm,
+        "alarms": cmd_alarms,
+        "delete-alarms": cmd_delete_alarms,
         "sniff": cmd_sniff,
         "write": cmd_write,
     }
