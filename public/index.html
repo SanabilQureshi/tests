@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Personal Brain</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/quill@2.0.2/dist/quill.snow.css" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">Brain</div>
+    <div class="view-toggle" role="tablist">
+      <button id="view-brain" class="view-btn active" data-view="brain">Brain</button>
+      <button id="view-columns" class="view-btn" data-view="columns">Columns</button>
+    </div>
+    <div class="search">
+      <input id="search-input" type="text" placeholder="Search thoughts…" autocomplete="off" />
+      <div id="search-results" class="search-results" hidden></div>
+    </div>
+    <div class="current-title" id="current-title"></div>
+  </header>
+
+  <main class="split">
+    <section class="left-pane">
+      <div id="brain-view" class="view brain-view active">
+        <div class="brain-toolbar">
+          <button id="btn-back" title="Back">←</button>
+          <button id="btn-add-parent">+ Parent</button>
+          <button id="btn-add-child">+ Child</button>
+          <button id="btn-add-jump">+ Jump</button>
+          <button id="btn-rename">Rename</button>
+          <button id="btn-delete" class="danger">Delete</button>
+        </div>
+        <div id="cy" class="cy"></div>
+      </div>
+      <div id="columns-view" class="view columns-view">
+        <div id="columns" class="columns"></div>
+      </div>
+    </section>
+    <section class="right-pane">
+      <div id="editor-host" class="editor-host"></div>
+      <div id="save-status" class="save-status"></div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/quill@2.0.2/dist/quill.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
