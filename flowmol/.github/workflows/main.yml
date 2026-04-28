@@ -1,0 +1,108 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "master" branch
+  push:
+    branches: [ "master" ]
+
+  pull_request:
+    branches: [ "master" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  ubuntu:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-20.04, ubuntu-22.04, ubuntu-24.04]
+        
+    steps:
+          
+      - name: Update repo
+        run: sudo apt-get update -y 
+        
+      - name: Build tools
+        run : sudo apt-get install -y gcc build-essential
+
+      - name: Install mpich
+        run: sudo apt-get install -y mpich   
+        
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v3
+      
+      - name: Build Flowmol
+        run: |
+          cd ./src
+          make PLATFORM=gfortran p
+          ldd parallel_md.exe
+
+      - name: Run Flowmol
+        run: |
+          cd ./src
+          mpiexec -n 1 ./parallel_md.exe 
+
+ # build-Windows-GUI:
+
+#    runs-on: ubuntu-latest
+    
+#    steps:
+#    - uses: actions/checkout@v2
+
+#    - name: Clone pyDataView and SimWrapPy packages
+#      working-directory: src/
+#      run: |
+#          git clone https://github.com/edwardsmith999/pyDataView.git pyDataView
+#          mv ./pyDataView/postproclib ./postproclib
+#          mv ./pyDataView/misclib ./misclib
+#          git clone https://github.com/edwardsmith999/SimWrapPy.git SimWrapPy
+#          mv ./SimWrapPy/simwraplib ./simwraplib          
+
+#    - name: Package Application for Windows
+#      uses: JackMcKew/pyinstaller-action-windows@main
+#      with:
+#        path: ./src/
+
+#    - uses: actions/upload-artifact@v2
+#      with:
+#        name: flowmol_input.exe
+#        path: ./src/dist/windows
+        
+        
+  # A workflow run is made up of one or more jobs that can run sequentially or in parallel
+#  windows:
+#    runs-on: windows-2019
+#    strategy:
+#      fail-fast: false
+
+#    steps:
+
+#      - name: Add msbuild to PATH
+#        uses: microsoft/setup-msbuild@v1.1
+
+#      - name: Setup Intel Fortran
+#        uses: modflowpy/install-intelfortran-action@v1
+        
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+#      - uses: actions/checkout@v3
+
+#      - name: Build using visual studio for release
+#        run: |
+#          msbuild .\platforms\flowmol_windows_build.sln -t:rebuild -verbosity:diag -property:Configuration=Release
+
+#      - name: Run Flowmol
+#        run: |
+#          cp .\src\default.in .\x64\Release\
+#          cd .\x64\Release\
+#          mpiexec.exe -n 1 .\flowmol_windows_build.exe
+        
+      #- uses: actions/checkout@v2
+      #- name: Setup tmate session
+      #  if: ${{ failure() }}
+      #  uses: mxschmitt/action-tmate@v3
